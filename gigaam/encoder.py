@@ -598,7 +598,7 @@ class ConformerEncoder(nn.Module):
         return {
             "audio_signal": {0: "batch_size", 2: "seq_len"},
             "length": {0: "batch_size"},
-            "encoded": {0: "batch_size", 1: "seq_len"},
+            "encoded": {0: "batch_size", 2: "seq_len"},
             "encoded_len": {0: "batch_size"},
         }
 
