@@ -1,10 +1,12 @@
 import math
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 try:
     from flash_attn import flash_attn_func
@@ -15,6 +17,16 @@ except Exception as err:
     IMPORT_FLASH_ERR = err
 
 from .utils import apply_masked_flash_attn, apply_rotary_pos_emb
+
+
+def _conformer_layer_fwd(
+    layer: nn.Module,
+    x: Tensor,
+    pos_emb: Union[Tensor, List[Tensor]],
+    att_mask: Optional[Tensor],
+    pad_mask: Optional[Tensor],
+) -> Tensor:
+    return layer(x=x, pos_emb=pos_emb, att_mask=att_mask, pad_mask=pad_mask)
 
 
 class StridingSubsampling(nn.Module):
@@ -62,24 +74,59 @@ class StridingSubsampling(nn.Module):
             self.out = torch.nn.Linear(conv_channels * int(out_length), feat_out)
         self.conv = torch.nn.Sequential(*layers)
 
-    def calc_output_length(self, lengths: Tensor) -> Tensor:
+    def calc_output_length(
+        self, lengths: Tensor, num_stages: Optional[int] = None
+    ) -> Tensor:
         """
-        Calculates the output length after applying the subsampling.
+        Valid length after applying ``num_stages`` strided subsampling conv
+        stages (defaults to all of them, i.e. the full subsampling output).
         """
-        lengths = lengths.to(torch.float)
+        if num_stages is None:
+            num_stages = self._sampling_num
         add_pad = 2 * self._padding - self._kernel_size
-        for _ in range(self._sampling_num):
-            lengths = torch.div(lengths + add_pad, self._stride) + 1.0
-            lengths = torch.floor(lengths)
+        lengths = lengths.to(torch.float)
+        for _ in range(num_stages):
+            lengths = torch.floor((lengths + add_pad) / self._stride + 1.0)
         return lengths.to(dtype=torch.int)
+
+    def _mask_time(self, x: Tensor, lengths: Tensor) -> Tensor:
+        """
+        Zero out the padded tail along the time axis (dim 2). The subsampling
+        convolutions are strided and have a receptive field wider than the
+        stride, so the padded frames of shorter samples leak into the last
+        valid frames. Left unmasked, the padding is the log-mel floor
+        (``log(1e-9) ~= -20.7``) of zero-padded audio, not zero, so a batched
+        short sample sees a different boundary than the same sample run alone
+        (where conv zero-padding applies instead). Re-zeroing after every conv
+        stage keeps the valid frames of batched inference aligned with the
+        batch-size-1 result.
+        """
+        time = torch.arange(x.size(2), device=x.device)
+        pad = time[None, :] >= lengths[:, None]  # [b, t]
+        pad = pad[:, None]  # add channel dim -> [b, 1, t]
+        if x.dim() == 4:
+            pad = pad[..., None]  # add feature dim for conv2d -> [b, 1, t, 1]
+        return x.masked_fill(pad, 0.0)
 
     def forward(self, x: Tensor, lengths: Tensor) -> Tuple[Tensor, Tensor]:
         if self.subsampling_type == "conv2d":
-            x = self.conv(x.unsqueeze(1))
+            x = x.unsqueeze(1)
+        else:
+            x = x.transpose(1, 2)
+
+        cur_len = lengths
+        x = self._mask_time(x, cur_len)
+        for module in self.conv:
+            x = module(x)
+            if isinstance(module, (torch.nn.Conv1d, torch.nn.Conv2d)):
+                cur_len = self.calc_output_length(cur_len, 1)
+                x = self._mask_time(x, cur_len)
+
+        if self.subsampling_type == "conv2d":
             b, _, t, _ = x.size()
             x = self.out(x.transpose(1, 2).reshape(b, t, -1))
         else:
-            x = self.conv(x.transpose(1, 2)).transpose(1, 2)
+            x = x.transpose(1, 2)
         return x, self.calc_output_length(lengths)
 
 
@@ -168,6 +215,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
     ) -> Tensor:
         q, k, v = self.forward_qkv(query, key, value)
         q = q.transpose(1, 2)
+        pos_emb = pos_emb.to(dtype=self.linear_pos.weight.dtype)
         p = self.linear_pos(pos_emb)
         p = p.view(pos_emb.shape[0], -1, self.h, self.d_k).transpose(1, 2)
         q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)
@@ -215,13 +263,13 @@ class RotaryPositionMultiHeadAttention(MultiHeadAttention):
             scores = scores.view(b, -1, self.h * self.d_k)
             return self.linear_out(scores)
         elif self.torch_sdpa_attn:
-            attn_mask = None if mask is None else ~mask.unsqueeze(1)
-            attn_output = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-            )
+            attn_mask = None
+            if mask is not None:
+                attn_mask = ~mask.unsqueeze(1)
+                # SDPA masks padding queries with true -inf; softmax over such a row is NaN in forward and backward.
+                # Unmask such rows entirely: their output is finite garbage that nothing reads.
+                attn_mask = attn_mask | (~attn_mask.any(dim=-1, keepdim=True))
+            attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
             attn_output = attn_output.transpose(1, 2).reshape(b, t, self.h * self.d_k)
             return self.linear_out(attn_output)
         else:
@@ -474,9 +522,11 @@ class ConformerEncoder(nn.Module):
         conv_norm_type: str = "batch_norm",
         conv_kernel_size: int = 31,
         flash_attn: bool = False,
+        activation_checkpointing: bool = False,
     ):
         super().__init__()
         self.feat_in = feat_in
+        self.activation_checkpointing = activation_checkpointing
         assert self_attention_model in [
             "rotary",
             "rel_pos",
@@ -514,12 +564,13 @@ class ConformerEncoder(nn.Module):
 
     def input_example(
         self,
-        batch_size: int = 1,
+        batch_size: int = 8,
         seqlen: int = 200,
     ) -> Tuple[Tensor, Tensor]:
         device = next(self.parameters()).device
-        features = torch.zeros(batch_size, self.feat_in, seqlen)
-        feature_lengths = torch.full([batch_size], features.shape[-1])
+        features = torch.randn(batch_size, self.feat_in, seqlen)
+        feature_lengths = torch.randint(1, seqlen + 1, (batch_size,))
+        feature_lengths[0] = seqlen
         return features.float().to(device), feature_lengths.to(device)
 
     def input_names(self) -> List[str]:
@@ -528,11 +579,26 @@ class ConformerEncoder(nn.Module):
     def output_names(self) -> List[str]:
         return ["encoded", "encoded_len"]
 
+    @contextmanager
+    def onnx_export_mode(self):
+        saved = []
+        for layer in self.layers:
+            attn = layer.self_attn
+            saved.append((attn.flash_attn, attn.torch_sdpa_attn))
+            attn.flash_attn = False
+            attn.torch_sdpa_attn = False
+        try:
+            yield
+        finally:
+            for layer, (fa, sdpa) in zip(self.layers, saved):
+                layer.self_attn.flash_attn = fa
+                layer.self_attn.torch_sdpa_attn = sdpa
+
     def dynamic_axes(self) -> Dict[str, Dict[int, str]]:
         return {
             "audio_signal": {0: "batch_size", 2: "seq_len"},
             "length": {0: "batch_size"},
-            "encoded": {0: "batch_size", 1: "seq_len"},
+            "encoded": {0: "batch_size", 2: "seq_len"},
             "encoded_len": {0: "batch_size"},
         }
 
@@ -560,11 +626,22 @@ class ConformerEncoder(nn.Module):
         pad_mask = ~pad_mask
 
         for layer in self.layers:
-            audio_signal = layer(
-                x=audio_signal,
-                pos_emb=pos_emb,
-                att_mask=att_mask,
-                pad_mask=pad_mask,
-            )
+            if self.activation_checkpointing and self.training:
+                audio_signal = checkpoint(
+                    _conformer_layer_fwd,
+                    layer,
+                    audio_signal,
+                    pos_emb,
+                    att_mask,
+                    pad_mask,
+                    use_reentrant=False,
+                )
+            else:
+                audio_signal = layer(
+                    x=audio_signal,
+                    pos_emb=pos_emb,
+                    att_mask=att_mask,
+                    pad_mask=pad_mask,
+                )
 
         return audio_signal.transpose(1, 2), length

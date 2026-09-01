@@ -1,5 +1,5 @@
 import os
-from typing import List, Tuple
+from typing import List, Tuple, cast
 
 import torch
 from huggingface_hub import snapshot_download
@@ -7,6 +7,7 @@ from huggingface_hub.errors import LocalEntryNotFoundError
 from pyannote.audio import Model, Pipeline
 from pyannote.audio.core.task import Problem, Resolution, Specifications
 from pyannote.audio.pipelines import VoiceActivityDetection
+from pyannote.core import Annotation
 from torch.torch_version import TorchVersion
 
 from .preprocess import load_audio
@@ -93,7 +94,7 @@ def segment_audio_file(
 
     audio = load_audio(wav_file)
     pipeline = get_pipeline(device)
-    sad_segments = pipeline(wav_file)
+    sad_segments = cast(Annotation, pipeline(wav_file))
 
     segments: List[torch.Tensor] = []
     curr_duration = 0.0
@@ -119,7 +120,9 @@ def segment_audio_file(
     for segment in sad_segments.get_timeline().support():
         start = max(0, segment.start)
         end = min(audio.shape[0] / sr, segment.end)
-        if curr_duration > new_chunk_threshold and (
+        if curr_duration == 0.0:
+            curr_start = start
+        elif curr_duration > new_chunk_threshold and (
             curr_duration + (end - curr_end) > max_duration
             or curr_duration > min_duration
         ):

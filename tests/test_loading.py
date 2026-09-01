@@ -44,13 +44,13 @@ def run_model_method(model, revision, test_audio):
     else:
         result = model.transcribe(test_audio)
         if "e2e" in revision:
-            assert (
-                _predictions[revision] == result
-            ), f"Transcription failed ({revision}): {result}"
+            assert _predictions[revision] == str(
+                result
+            ), f"Transcription failed ({revision}): {str(result)}"
         else:
-            assert (
-                _predictions["asr"] == result
-            ), f"Transcription failed ({revision}): {result}"
+            assert _predictions["asr"] == str(
+                result
+            ), f"Transcription failed ({revision}): {str(result)}"
         logger.info(f"{revision}: Transcription completed")
 
 
@@ -69,6 +69,10 @@ def run_model_method(model, revision, test_audio):
         "v3_e2e_ctc",
         "v3_e2e_rnnt",
         "v3_ssl",
+        "multilingual_ctc",
+        "multilingual_ssl",
+        "multilingual_large_ctc",
+        "multilingual_large_ssl",
     ],
 )
 @pytest.mark.full
@@ -79,7 +83,9 @@ def test_model_revision_full(revision, test_audio):
     os.remove(os.path.join(gigaam._CACHE_DIR, f"{revision}.ckpt"))
 
 
-@pytest.mark.parametrize("revision", ["emo", "v2_ssl", "v3_ctc", "v3_e2e_rnnt"])
+@pytest.mark.parametrize(
+    "revision", ["emo", "v2_ssl", "v3_ctc", "v3_e2e_rnnt", "multilingual_ctc"]
+)
 @pytest.mark.partial
 def test_model_revision_partial(revision, test_audio):
     """Test specific model revision loads and processes audio (partial models enabled)"""

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gigaam"
-version = "0.1.0"
+version = "0.2.0"
 description = "GigaAM: A package for audio modeling and ASR."
 readme = "README.md"
 license = "MIT"
@@ -19,26 +19,44 @@ dependencies = [
     "omegaconf==2.3.*",
     "onnx==1.19.*",
     "onnxruntime==1.23.*",
+    "soundfile",
     "sentencepiece",
-    "torch>=2.5,<2.9",
-    "torchaudio>=2.5,<2.9",
     "tqdm",
 ]
 
 [project.optional-dependencies]
+# Why torch is optional: often preinstalled and reinstall is slow.
+# Older builds also work, pinned extras are recommended.
+torch = [
+    "torch>=2.6",
+    "torchaudio>=2.6",
+]
 longform = [
-    "torch==2.8.*",
-    "torchaudio==2.8.*",
-    "pyannote.audio==4.0",
-    "torchcodec==0.7",
     "numba>=0.62",
+    "pyannote.audio==4.0.*",
+    "pyarrow>=23",
+    "torch==2.10.*",
+    "torchaudio==2.10.*",
+    "torchcodec==0.10",
+    "transformers==5.*",
+]
+train = [
+    "editdistance",
+    "lightning>=2.6",
+    "tensorboard>=2.20",
+    "wandb>=0.25",
 ]
 tests = [
     "pytest",
     "pytest-cov",
     "scipy",
-    "soundfile",
-    "librosa",
+]
+lint = [
+    "black==26.1.0",
+    "isort==7.0.0",
+    "flake8==7.3.0",
+    "mypy",
+    "types-requests",
 ]
 
 [project.urls]
@@ -46,3 +64,15 @@ Homepage = "https://github.com/salute-developers/GigaAM/"
 
 [tool.setuptools.packages.find]
 include = ["gigaam"]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+
+[tool.pytest.ini_options]
+markers = [
+    "full: full model-revision tests that download every checkpoint",
+    "partial: lightweight subset of model-revision tests",
+]

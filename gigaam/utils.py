@@ -1,15 +1,50 @@
+import csv
 import os
+import unicodedata
 import warnings
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
+import soundfile as sf
 import torch
 import torch.nn.functional as F
+import torchaudio
 from torch import Tensor
 from torch.jit import TracerWarning
 
-from .preprocess import load_audio
+from .preprocess import SAMPLE_RATE
+from .types import AudioDatasetSample
+
+
+def normalize_raw_text(text: str) -> str:
+    """
+    Script-agnostic normalization: lowercase, collapse whitespace,
+    and keep only alphanumeric characters plus spaces — i.e. drop punctuation/symbols.
+
+    Word-internal apostrophes are preserved (e.g. ``don't`` stays ``don't``).
+    Apostrophe variants are normalized to ASCII ``'``.
+    Standalone quotes are dropped (not between two alphanumerics).
+    Hyphens/dashes (Unicode category Pd) split words (``word-internal`` -> ``word internal``).
+    """
+    text = text.replace("ё", "е").replace("Ё", "Е").lower()
+    for quote in ("’", "‘", "ʻ", "ʼ"):
+        text = text.replace(quote, "'")
+    out = []
+    for i, c in enumerate(text):
+        if c == "'":
+            if (
+                0 < i < len(text) - 1
+                and text[i - 1].isalnum()
+                and text[i + 1].isalnum()
+            ):
+                out.append(c)
+        elif c.isalnum() or c.isspace():
+            out.append(c)
+        elif unicodedata.category(c) == "Pd":
+            out.append(" ")
+    return " ".join("".join(out).split())
 
 
 def onnx_converter(
@@ -23,7 +58,12 @@ def onnx_converter(
         Union[Dict[str, List[int]], Dict[str, Dict[int, str]]]
     ] = None,
     opset_version: int = 17,
+    export_dtype: torch.dtype = torch.float32,
 ):
+    """
+    Export a submodule to ONNX: casts inputs and ``module`` to ``export_dtype`` for tracing,
+    then restores the module to float32 via ``module.float()`` so the model stays usable.
+    """
     if inputs is None:
         inputs = module.input_example()  # type: ignore[operator]
     if input_names is None:
@@ -31,23 +71,28 @@ def onnx_converter(
     if output_names is None:
         output_names = module.output_names()  # type: ignore[operator]
 
+    inputs = tuple(
+        x.to(export_dtype) if x.dtype == torch.float32 else x for x in inputs
+    )
+
     Path(out_dir).mkdir(exist_ok=True, parents=True)
     out_path = str(Path(out_dir) / f"{model_name}.onnx")
-    saved_dtype = next(module.parameters()).dtype
     with warnings.catch_warnings(), torch.no_grad():
         warnings.simplefilter("ignore", category=UserWarning)
         warnings.simplefilter("ignore", category=TracerWarning)
         torch.onnx.export(
-            module.to(torch.float32),
+            module.to(export_dtype),
             inputs,
             out_path,
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
             opset_version=opset_version,
+            dynamo=False,
         )
     print(f"Successfully ported onnx {model_name} to {out_path}.")
-    module.to(saved_dtype)
+    # We force the whole module to float32 to avoid fp16 preprocessing issues
+    module.float()
 
 
 def format_time(seconds: float) -> str:
@@ -80,6 +125,8 @@ def apply_rotary_pos_emb(
         cos[offset : q.shape[0] + offset, ...],
         sin[offset : q.shape[0] + offset, ...],
     )
+    cos = cos.to(dtype=q.dtype)
+    sin = sin.to(dtype=q.dtype)
     return (q * cos) + (rtt_half(q) * sin), (k * cos) + (rtt_half(k) * sin)
 
 
@@ -138,7 +185,7 @@ def apply_masked_flash_attn(
     return scores
 
 
-def download_short_audio():
+def download_short_audio() -> str:
     """Download test audio file if not exists"""
     audio_file = "example.wav"
     if not os.path.exists(audio_file):
@@ -149,7 +196,7 @@ def download_short_audio():
     return audio_file
 
 
-def download_long_audio():
+def download_long_audio() -> str:
     """Download test audio file if not exists"""
     audio_file = "long_example.wav"
     if not os.path.exists(audio_file):
@@ -162,37 +209,213 @@ def download_long_audio():
 
 class AudioDataset(torch.utils.data.Dataset):
     """
-    Helper class for creating batched inputs
+    Unified dataset class for training and inference.
+    Supports loading from manifest file or an iterable of audio paths / waveforms.
+    Provides min / max duration filtering, text normalization, and pre-tokenization.
     """
 
-    def __init__(self, lst: List[Union[str, np.ndarray, torch.Tensor]]):
-        if len(lst) == 0:
-            raise ValueError("AudioDataset cannot be initialized with an empty list")
-        assert isinstance(
-            lst[0], (str, np.ndarray, torch.Tensor)
-        ), f"Unexpected dtype: {type(lst[0])}"
-        self.lst = lst
+    def __init__(
+        self,
+        data: Union[str, Iterable[Union[str, np.ndarray, torch.Tensor]]],
+        tokenizer=None,
+        max_duration: Optional[float] = None,
+        min_duration: float = 0.0,
+        raw_text: bool = False,
+        return_tokens: bool = False,
+    ):
+        self.raw_text = raw_text
+        self.return_tokens = return_tokens
+        self.tokenizer = tokenizer
+        self.samples: List[AudioDatasetSample] = []
 
-    def __len__(self):
-        return len(self.lst)
+        if return_tokens and tokenizer is None:
+            raise ValueError("tokenizer is required when return_tokens=True")
 
-    def __getitem__(self, idx):
-        item = self.lst[idx]
-        if isinstance(item, str):
-            wav_tns = load_audio(item)
-        elif isinstance(item, np.ndarray):
-            wav_tns = torch.from_numpy(item)
-        elif isinstance(item, torch.Tensor):
-            wav_tns = item
+        self.encode = self._make_encoder(tokenizer)
+
+        if isinstance(data, str):
+            self._load_manifest(data, min_duration, max_duration)
+        elif isinstance(data, Iterable) and not isinstance(
+            data, (str, bytes, bytearray)
+        ):
+            self._load_iterable(data, min_duration, max_duration)
         else:
-            raise RuntimeError(f"Unexpected sample type: {type(item)} at idx={idx}")
-        return wav_tns
+            raise TypeError(f"Unsupported data type: {type(data)}")
+
+        if not self.samples:
+            raise ValueError("No valid samples found after filtering")
+
+    def _make_encoder(self, tokenizer):
+        if tokenizer is None:
+            return None
+
+        if getattr(tokenizer, "charwise", False):
+            c2i = {c: i for i, c in enumerate(tokenizer.vocab)}
+            return lambda text: [c2i[c] for c in text if c in c2i]
+
+        return tokenizer.model.encode
+
+    def normalize_text(self, text: str) -> str:
+        if not self.raw_text:
+            return text
+
+        text = normalize_raw_text(text)
+
+        if self.tokenizer is not None and getattr(self.tokenizer, "charwise", False):
+            vocab = set(self.tokenizer.vocab)
+            return "".join(c for c in text if c in vocab)
+
+        return text
 
     @staticmethod
-    def collate(wavs):
-        lengths = torch.tensor([len(wav) for wav in wavs])
-        max_len = lengths.max().item()
-        wav_tns = torch.zeros(len(wavs), max_len, dtype=wavs[0].dtype)
-        for idx, wav in enumerate(wavs):
-            wav_tns[idx, : wav.shape[-1]] = wav.squeeze()
-        return wav_tns, lengths
+    def _get_duration(item: Union[str, np.ndarray, Tensor]) -> float:
+        if isinstance(item, str):
+            with sf.SoundFile(item) as f:
+                return f.frames / f.samplerate
+        if isinstance(item, np.ndarray):
+            return len(item) / SAMPLE_RATE
+        if isinstance(item, torch.Tensor):
+            return item.numel() / SAMPLE_RATE
+        raise TypeError(f"Unexpected sample type: {type(item)}")
+
+    def _duration_ok(
+        self, duration: float, min_duration: float, max_duration: Optional[float]
+    ) -> bool:
+        if duration < min_duration:
+            return False
+        if max_duration is not None and duration > max_duration:
+            return False
+        return True
+
+    @staticmethod
+    def _print_filtered(
+        n_total: int, dur_total: float, n_filt: int, dur_filt: float
+    ) -> None:
+        if n_total == 0:
+            return
+        pn = 100.0 * n_filt / n_total
+        pd = 100.0 * dur_filt / dur_total if dur_total > 0 else 0.0
+        h_filt, h_total = dur_filt / 3600.0, dur_total / 3600.0
+        print(
+            f"filtered by duration: {n_filt}/{n_total} samples ({pn:.1f}%), "
+            f"{h_filt:.2f}/{h_total:.2f} h ({pd:.1f}%)"
+        )
+
+    def _append_sample(
+        self,
+        item: Union[str, np.ndarray, Tensor],
+        duration: float,
+        text: Optional[str] = None,
+    ) -> None:
+        norm_text: Optional[str] = None
+        tokens: Optional[List[int]] = None
+        if text is not None:
+            norm_text = self.normalize_text(text.strip())
+            if self.return_tokens:
+                assert self.encode is not None
+                tokens = self.encode(norm_text)
+        self.samples.append(
+            AudioDatasetSample(
+                item=item, duration=duration, text=norm_text, tokens=tokens
+            )
+        )
+
+    def _load_manifest(
+        self, manifest_path: str, min_duration: float, max_duration: Optional[float]
+    ):
+        data_dir = Path(manifest_path).resolve().parent
+        n_total = n_filt = 0
+        dur_total = dur_filt = 0.0
+
+        with open(manifest_path) as f:
+            for row in csv.DictReader(f, delimiter="\t"):
+                duration = float(row["duration"])
+                n_total += 1
+                dur_total += duration
+                if not self._duration_ok(duration, min_duration, max_duration):
+                    n_filt += 1
+                    dur_filt += duration
+                    continue
+
+                pth = Path(row["path"])
+                path = str((pth if pth.is_absolute() else data_dir / pth).resolve())
+                text = row["transcription"] if "transcription" in row else None
+                self._append_sample(path, duration, text=text)
+
+        self._print_filtered(n_total, dur_total, n_filt, dur_filt)
+
+    def _load_iterable(
+        self,
+        data: Iterable[Union[str, np.ndarray, torch.Tensor]],
+        min_duration: float,
+        max_duration: Optional[float],
+    ):
+        n_total = n_filt = 0
+        dur_total = dur_filt = 0.0
+        for item in data:
+            if not isinstance(item, (str, np.ndarray, torch.Tensor)):
+                raise TypeError(f"Unexpected dtype: {type(item)}")
+
+            duration = self._get_duration(item)
+            n_total += 1
+            dur_total += duration
+            if not self._duration_ok(duration, min_duration, max_duration):
+                n_filt += 1
+                dur_filt += duration
+                continue
+
+            self._append_sample(item, duration)
+
+        self._print_filtered(n_total, dur_total, n_filt, dur_filt)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    @staticmethod
+    def _load_audio(item: Union[str, np.ndarray, Tensor]) -> Tensor:
+        if isinstance(item, str):
+            wav, sr = torchaudio.load(item)
+            if wav.shape[0] > 1:
+                wav = wav.mean(dim=0, keepdim=True)
+            wav = wav.squeeze(0)
+            if sr != SAMPLE_RATE:
+                wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
+            return wav
+        if isinstance(item, np.ndarray):
+            return torch.from_numpy(item)
+        if isinstance(item, torch.Tensor):
+            return item
+        raise TypeError(f"Unexpected sample type: {type(item)}")
+
+    def __getitem__(self, idx: int) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        sample = self.samples[idx]
+        wav = self._load_audio(sample.item)
+
+        if self.return_tokens:
+            assert sample.tokens is not None
+            return wav, torch.tensor(sample.tokens, dtype=torch.long)
+
+        return wav
+
+    @staticmethod
+    def collate(wavs: List[Tensor]) -> Tuple[Tensor, Tensor]:
+        lengths = torch.tensor([len(w) for w in wavs], dtype=torch.long)
+        max_len = int(lengths.max().item())
+
+        batch = torch.zeros(len(wavs), max_len, dtype=wavs[0].dtype)
+        for i, wav in enumerate(wavs):
+            batch[i, : wav.shape[-1]] = wav.squeeze()
+
+        return batch, lengths
+
+    def collate_fn(
+        self, batch: List[Union[Tensor, Tuple[Tensor, Tensor]]]
+    ) -> Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor, Tensor]]:
+        if not self.return_tokens:
+            return self.collate(cast(List[Tensor], batch))
+
+        wavs, tokens = zip(*cast(List[Tuple[Tensor, Tensor]], batch))
+        wav_pad, wav_lens = self.collate(list(wavs))
+        tok_pad, tok_lens = self.collate(list(tokens))
+
+        return wav_pad, wav_lens, tok_pad, tok_lens
